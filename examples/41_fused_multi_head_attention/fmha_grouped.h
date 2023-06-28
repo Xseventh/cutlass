@@ -367,6 +367,7 @@ public:
   // Shared storage - depends on kernel params
   struct ScalingCoefs {
     cutlass::Array<ElementAccumulator, kQueriesPerBlock> m_prime;
+    cutlass::Array<ElementAccumulator, kQueriesPerBlock * WarpCount::kN> prime;
     cutlass::Array<ElementAccumulator, kQueriesPerBlock> s_prime;
     cutlass::Array<ElementAccumulator, kQueriesPerBlock> mi;
   };
@@ -488,6 +489,7 @@ public:
   void operator()(Params const &params, SharedStorage &shared_storage) {
     auto& m_prime = shared_storage.m_prime;
     auto& s_prime = shared_storage.s_prime;
+    auto& prime = shared_storage.prime;
     [[maybe_unused]] auto& si = shared_storage.after_mm0.si;
     auto& mi = shared_storage.mi;
 
@@ -665,6 +667,7 @@ public:
                           mi,
                           m_prime,
                           s_prime,
+                          prime,
                           lane_id(),
                           thread_id(),
                           warp_id(),
@@ -860,6 +863,7 @@ public:
       cutlass::Array<accum_t, kQueriesPerBlock>& mi,
       cutlass::Array<accum_t, kQueriesPerBlock>& m_prime,
       cutlass::Array<accum_t, kQueriesPerBlock>& s_prime,
+      cutlass::Array<accum_t, kQueriesPerBlock * WarpCount::kN>& prime,
       int8_t lane_id,
       int8_t thread_id,
       int8_t warp_id,
@@ -954,9 +958,21 @@ public:
                     lane_id, total_row, [](accum_t a, accum_t b) {
                       return a + b;
                     })) {
-              atomicAdd(&s_prime[accum_m], total_row);
+              prime[accum_m * WarpCount::kN + tile_offset.column()] = total_row;
+//              atomicAdd(&s_prime[accum_m], total_row);
             }
           });
+
+        __syncthreads();
+
+        if (thread_id < kQueriesPerBlock) {
+            accum_t sum_prime(0.0);
+            CUTLASS_PRAGMA_UNROLL
+            for (int i = 0; i < WarpCount::kN; i++) {
+                sum_prime += prime[thread_id * WarpCount::kN + i];
+            }
+            s_prime[thread_id] = s_prime[thread_id] + sum_prime;
+        }
     }
   }
 };
