@@ -117,6 +117,7 @@ public:
   using ElementK = scalar_t;
   using ElementP = accum_t;
   using ElementV = scalar_t;
+  using ElementM = int8_t;
   using ElementO = output_t;
   using ElementOAccum = output_accum_t;
   using ElementAccumulator = accum_t;
@@ -125,6 +126,7 @@ public:
   using LayoutK = typename MM0::LayoutB;
   using LayoutP = typename MM0::LayoutC;
   using LayoutV = typename MM1::LayoutB;
+  using LayoutM = typename cutlass::layout::RowMajor;
   using LayoutO = typename MM1::LayoutC;
 
   static bool const kPreloadV = (MM1::Mma::ArchTag::kMinComputeCapability >= 80 &&
@@ -133,6 +135,7 @@ public:
   static int const kAlignmentQ = MM0::kAlignmentA;
   static int const kAlignmentK = MM0::kAlignmentB;
   static int const kAlignmentV = 1;
+  static int const kAlignmentM = 1;
 
   using ThreadblockShape = typename MM0::ThreadblockShape;
 
@@ -174,12 +177,14 @@ public:
     ElementK ** ptr_K;
     ElementP ** ptr_P;
     ElementV ** ptr_V;
+    ElementM ** ptr_M;
     ElementO ** ptr_O;
     ElementOAccum ** ptr_O_accum;
 
     typename LayoutQ::Stride::LongIndex *ldq;
     typename LayoutK::Stride::LongIndex *ldk;
     typename LayoutP::Stride::LongIndex *ldv;
+    typename LayoutP::Stride::LongIndex *ldm;
     typename LayoutO::Stride::LongIndex *ldo;
 
     // Scale
@@ -204,11 +209,13 @@ public:
       ptr_K(nullptr),
       ptr_P(nullptr),
       ptr_V(nullptr),
+      ptr_M(nullptr),
       ptr_O(nullptr),
       ptr_O_accum(nullptr),
       ldq(nullptr),
       ldk(nullptr),
       ldv(nullptr),
+      ldm(nullptr),
       ldo(nullptr),
       scale(0),
       causal(false),
@@ -228,12 +235,14 @@ public:
       ElementK ** ptr_K,
       ElementP ** ptr_P,
       ElementV ** ptr_V,
+      ElementM ** ptr_M,
       ElementO ** ptr_O,
       ElementOAccum ** ptr_O_accum,
       typename LayoutQ::Stride::LongIndex *ldq,
       typename LayoutK::Stride::LongIndex *ldk,
       typename LayoutP::Stride::LongIndex *ldp,
       typename LayoutV::Stride::LongIndex *ldv,
+      typename LayoutV::Stride::LongIndex *ldm,
       typename LayoutO::Stride::LongIndex *ldo,
       bool causal,
       ElementAccumulator scale,
@@ -247,11 +256,13 @@ public:
       ptr_K(ptr_K),
       ptr_P(ptr_P),
       ptr_V(ptr_V),
+      ptr_M(ptr_M),
       ptr_O(ptr_O),
       ptr_O_accum(kNeedsOutputAccumulatorBuffer ? ptr_O_accum : (accum_t**)ptr_O),
       ldq(ldq),
       ldk(ldk),
       ldv(ldv),
+      ldm(ldm),
       ldo(ldo),
       causal(causal),
       scale(scale),
@@ -264,9 +275,11 @@ public:
       CHECK_ALIGNED_PTR(ptr_Q, kAlignmentQ);
       CHECK_ALIGNED_PTR(ptr_K, kAlignmentK);
       CHECK_ALIGNED_PTR(ptr_V, kAlignmentV);
+      CHECK_ALIGNED_PTR(ptr_M, kAlignmentM);
       XFORMERS_CHECK(ldq % kAlignmentQ == 0, "query is not correctly aligned");
       XFORMERS_CHECK(ldk % kAlignmentK == 0, "key is not correctly aligned");
       XFORMERS_CHECK(ldv % kAlignmentV == 0, "value is not correctly aligned");
+      XFORMERS_CHECK(ldm % kAlignmentM == 0, "mask is not correctly aligned");
       return true;
     }
   };
@@ -285,12 +298,14 @@ public:
     ElementK ** ptr_K;
     ElementP ** ptr_P;
     ElementV ** ptr_V;
+    ElementM ** ptr_M;
     ElementO ** ptr_O;
     ElementOAccum ** ptr_O_accum;
 
     typename LayoutQ::Stride::LongIndex *ldq;
     typename LayoutK::Stride::LongIndex *ldk;
     typename LayoutP::Stride::LongIndex *ldv;
+    typename LayoutP::Stride::LongIndex *ldm;
     typename LayoutO::Stride::LongIndex *ldo;
 
     ElementAccumulator scale;
@@ -306,11 +321,13 @@ public:
       ptr_K(nullptr),
       ptr_P(nullptr),
       ptr_V(nullptr),
+      ptr_M(nullptr),
       ptr_O(nullptr),
       ptr_O_accum(nullptr),
       ldq(nullptr),
       ldk(nullptr),
       ldv(nullptr),
+      ldm(nullptr),
       ldo(nullptr),
       causal(false),
       scale(0)
@@ -326,11 +343,13 @@ public:
       ptr_K(args.ptr_K),
       ptr_P(args.ptr_P),
       ptr_V(args.ptr_V),
+      ptr_M(args.ptr_M),
       ptr_O(args.ptr_O),
       ptr_O_accum(kNeedsOutputAccumulatorBuffer ? args.ptr_O_accum : (accum_t**)args.ptr_O),
       ldq(args.ldq),
       ldk(args.ldk),
       ldv(args.ldv),
+      ldm(args.ldm),
       ldo(args.ldo),
       causal(args.causal),
       scale(args.scale)
@@ -353,6 +372,7 @@ public:
       ptr_K = args.ptr_K;
       ptr_P = args.ptr_P;
       ptr_V = args.ptr_V;
+      ptr_M = args.ptr_M;
       ptr_O = args.ptr_O;
       ptr_O_accum = kNeedsOutputAccumulatorBuffer ? args.ptr_O_accum : (accum_t**)args.ptr_O;
       ldq = args.ldq;
@@ -632,6 +652,27 @@ public:
               (warp_id() % MM0::Mma::WarpCount::kM),
               (warp_id() / MM0::Mma::WarpCount::kM)
             };
+
+        // Mask out last if causal
+        if (params.ptr_M != nullptr && params.ptr_M[problem_idx] != nullptr) {
+            auto lane_offset = MM0::AccumLambdaIterator::get_lane_offset(
+                lane_id(), warp_id(), iteratorC_tile_offset);
+            TensorRef<ElementM, LayoutM> tensor_ref_M;
+            MM0::AccumLambdaIterator::iterateRows(
+                lane_offset,
+                [&](int accum_m) {
+                    ElementM *ptr_M = params.ptr_M[problem_idx] + TileParams::query_start(threadblock_idx) * params.ldm[problem_idx];
+                    tensor_ref_M.reset(ptr_M, LayoutM(params.ldm[problem_idx]));
+                },
+                [&](int accum_m, int accum_n, int idx) {
+                    bool mask_value = tensor_ref_M.at({accum_m, accum_n});
+                    if (mask_value) {
+                        accum[idx] =
+                            -cutlass::platform::numeric_limits<accum_t>::infinity();
+                    }
+                },
+                [&](int accum_m) {});
+        }
 
         // Mask out last if causal
         if (params.causal && num_keys - iter_key_start <= kKeysPerBlock) {

@@ -388,6 +388,7 @@ public:
   using ElementP = accum_t;
   using ElementAccumulator = accum_t;
   using ElementV = scalar_t;
+  using ElementM = int8_t;
   using ElementO = output_t;
   using ElementOAccum = output_accum_t;
 
@@ -401,6 +402,7 @@ public:
   using LayoutK = cutlass::layout::ColumnMajor;
   using LayoutP = cutlass::layout::RowMajor;
   using LayoutV = cutlass::layout::RowMajor;
+  using LayoutM = cutlass::layout::RowMajor;
   using LayoutO = cutlass::layout::RowMajor;
 
   using MatrixCoord = typename LayoutP::TensorCoord;
@@ -420,6 +422,7 @@ private:
   cutlass::Distribution::Kind init_K;
   cutlass::Distribution::Kind init_P;
   cutlass::Distribution::Kind init_V;
+  cutlass::Distribution::Kind init_M;
   cutlass::Distribution::Kind init_O;
   uint32_t seed;
 
@@ -431,12 +434,14 @@ private:
   std::vector<int64_t> offset_K;
   std::vector<int64_t> offset_P;
   std::vector<int64_t> offset_V;
+  std::vector<int64_t> offset_M;
   std::vector<int64_t> offset_O;
 
   std::vector<int64_t> ldq_host;
   std::vector<int64_t> ldk_host;
   std::vector<int64_t> ldp_host;
   std::vector<int64_t> ldv_host;
+  std::vector<int64_t> ldm_host;
   std::vector<int64_t> ldo_host;
   std::vector<int64_t> seqlen_host;
 
@@ -444,6 +449,7 @@ private:
   cutlass::DeviceAllocation<int64_t> ldk;
   cutlass::DeviceAllocation<int64_t> ldp;
   cutlass::DeviceAllocation<int64_t> ldv;
+  cutlass::DeviceAllocation<int64_t> ldm;
   cutlass::DeviceAllocation<int64_t> ldo;
   cutlass::DeviceAllocation<int64_t> seqlen;
 
@@ -451,6 +457,7 @@ private:
   cutlass::DeviceAllocation<ElementK> block_K;
   cutlass::DeviceAllocation<ElementP> block_P;
   cutlass::DeviceAllocation<ElementV> block_V;
+  cutlass::DeviceAllocation<ElementM> block_M;
   cutlass::DeviceAllocation<ElementO> block_O;
   cutlass::DeviceAllocation<ElementOAccum> block_O_accumulate;
   cutlass::DeviceAllocation<ElementNorm> block_Norm;
@@ -462,6 +469,7 @@ private:
   cutlass::DeviceAllocation<ElementK *> ptr_K;
   cutlass::DeviceAllocation<ElementP *> ptr_P;
   cutlass::DeviceAllocation<ElementV *> ptr_V;
+  cutlass::DeviceAllocation<ElementM *> ptr_M;
   cutlass::DeviceAllocation<ElementO *> ptr_O;
   cutlass::DeviceAllocation<ElementOAccum *> ptr_O_accumulate;
 
@@ -478,10 +486,11 @@ public:
     cutlass::Distribution::Kind init_K_ = cutlass::Distribution::Uniform,
     cutlass::Distribution::Kind init_P_ = cutlass::Distribution::Uniform,
     cutlass::Distribution::Kind init_V_ = cutlass::Distribution::Uniform,
+    cutlass::Distribution::Kind init_M_ = cutlass::Distribution::AllZeros,
     cutlass::Distribution::Kind init_O_ = cutlass::Distribution::Uniform,
     uint32_t seed_ = 3080
   ):
-    options(options_), init_Q(init_Q_), init_K(init_K_), init_P(init_P_), init_V(init_V_), init_O(init_O_), seed(seed_) { }
+    options(options_), init_Q(init_Q_), init_K(init_K_), init_P(init_P_), init_V(init_V_), init_M(init_M_), init_O(init_O_), seed(seed_) { }
 
   int problem_count() const {
     return (options.head_number * options.batch_size);
@@ -530,9 +539,18 @@ private:
       // Fill with increasing elements
       cutlass::reference::device::BlockFillSequential(
         ptr, capacity, Element(1), Element());
-    } 
+    }
+    else if (dist_kind == cutlass::Distribution::AllOnes) {
+        // Fill with all 1s
+        cutlass::reference::device::BlockFillSequential(
+            ptr, capacity, Element(), Element(1));
+    }
+    else if (dist_kind == cutlass::Distribution::AllZeros) {
+        // Fill with all 1s
+        cutlass::reference::device::BlockFillSequential(
+            ptr, capacity, Element(), Element(0));
+    }
     else {
-
       // Fill with all 1s
       cutlass::reference::device::BlockFillSequential(
         ptr, capacity, Element(), Element(1));
@@ -561,12 +579,14 @@ private:
     int64_t total_elements_K = 0;
     int64_t total_elements_P = 0;
     int64_t total_elements_V = 0;
+    int64_t total_elements_M = 0;
     int64_t total_elements_O = 0;
 
     ldq_host.resize(problem_count());
     ldk_host.resize(problem_count());
     ldp_host.resize(problem_count());
     ldv_host.resize(problem_count());
+    ldm_host.resize(problem_count());
     ldo_host.resize(problem_count());
     seqlen_host.resize(problem_count());
 
@@ -579,6 +599,7 @@ private:
       ldk_host.at(i) = LayoutK::packed({problem0.k(), problem0.n()}).stride(0);
       ldp_host.at(i) = LayoutP::packed({problem0.m(), problem0.n()}).stride(0);
       ldv_host.at(i) = LayoutV::packed({problem1.k(), problem1.n()}).stride(0);
+      ldm_host.at(i) = LayoutM::packed({problem0.m(), problem0.n()}).stride(0);
       ldo_host.at(i) = LayoutO::packed({problem1.m(), problem1.n()}).stride(0);
 
       // m = n for attention problems.
@@ -588,18 +609,21 @@ private:
       offset_K.push_back(total_elements_K);
       offset_P.push_back(total_elements_P);
       offset_V.push_back(total_elements_V);
+      offset_M.push_back(total_elements_M);
       offset_O.push_back(total_elements_O);
 
       int64_t elements_Q = problem0.m() * problem0.k();
       int64_t elements_K = problem0.k() * problem0.n();
       int64_t elements_P = problem0.m() * problem0.n();
       int64_t elements_V = problem1.k() * problem1.n();
+      int64_t elements_M = problem0.m() * problem0.n();
       int64_t elements_O = problem1.m() * problem1.n();
 
       total_elements_Q += elements_Q;
       total_elements_K += elements_K;
       total_elements_P += elements_P;
       total_elements_V += elements_V;
+      total_elements_M += elements_M;
       total_elements_O += elements_O;
 
     }
@@ -618,6 +642,7 @@ private:
     ldk.reset(problem_count());
     ldp.reset(problem_count());
     ldv.reset(problem_count());
+    ldm.reset(problem_count());
     ldo.reset(problem_count());
     seqlen.reset(problem_count());
 
@@ -625,6 +650,7 @@ private:
     ldk.copy_from_host(ldk_host.data());
     ldp.copy_from_host(ldp_host.data());
     ldv.copy_from_host(ldv_host.data());
+    ldm.copy_from_host(ldm_host.data());
     ldo.copy_from_host(ldo_host.data());
     seqlen.copy_from_host(seqlen_host.data());
 
@@ -636,6 +662,7 @@ private:
     block_K.reset(total_elements_K);
     block_P.reset(total_elements_P);
     block_V.reset(total_elements_V);
+    block_M.reset(total_elements_M);
     block_O.reset(total_elements_O);
 
     if (kNeedsOutputAccumulatorBuffer) {
@@ -651,6 +678,7 @@ private:
     std::vector<ElementK *> ptr_K_host(problem_count());
     std::vector<ElementP *> ptr_P_host(problem_count());
     std::vector<ElementV *> ptr_V_host(problem_count());
+    std::vector<ElementM *> ptr_M_host(problem_count());
     std::vector<ElementO *> ptr_O_host(problem_count());
     std::vector<ElementOAccum *> ptr_O_accumulate_host(problem_count());
     std::vector<ElementNorm *> ptr_norm_host(problem_count());
@@ -661,6 +689,7 @@ private:
       ptr_K_host.at(i) = block_K.get() + offset_K.at(i);
       ptr_P_host.at(i) = block_P.get() + offset_P.at(i);
       ptr_V_host.at(i) = block_V.get() + offset_V.at(i);
+      ptr_M_host.at(i) = block_M.get() + offset_M.at(i);
       ptr_O_host.at(i) = block_O.get() + offset_O.at(i);
 
       if (kNeedsOutputAccumulatorBuffer) {
@@ -680,6 +709,9 @@ private:
     ptr_V.reset(problem_count());
     ptr_V.copy_from_host(ptr_V_host.data());
 
+    ptr_M.reset(problem_count());
+    ptr_M.copy_from_host(ptr_M_host.data());
+
     ptr_O.reset(problem_count());
     ptr_O.copy_from_host(ptr_O_host.data());
 
@@ -695,6 +727,7 @@ private:
     initialize_tensor_(block_Q.get(), total_elements_Q, init_Q, seed + 1);
     initialize_tensor_(block_K.get(), total_elements_K, init_K, seed + 2);
     initialize_tensor_(block_V.get(), total_elements_V, init_V, seed + 3);
+    initialize_tensor_(block_M.get(), total_elements_M, init_M, seed + 4);
 
   }
 
@@ -738,18 +771,21 @@ private:
       LayoutK layout_K(ldk_host.at(i));
       LayoutP layout_P(ldp_host.at(i));
       LayoutV layout_V(ldv_host.at(i));
+      LayoutM layout_M(ldm_host.at(i));
       LayoutO layout_O(ldo_host.at(i));
 
       MatrixCoord extent_Q{problem0.m(), problem0.k()};
       MatrixCoord extent_K{problem0.k(), problem0.n()};
       MatrixCoord extent_P{problem0.m(), problem0.n()};
       MatrixCoord extent_V{problem1.k(), problem1.n()};
+      MatrixCoord extent_M{problem0.m(), problem0.n()};
       MatrixCoord extent_O{problem1.m(), problem1.n()};
 
       cutlass::TensorView<ElementQ, LayoutQ> view_Q(block_Q.get() + offset_Q.at(i), layout_Q, extent_Q);
       cutlass::TensorView<ElementK, LayoutK> view_K(block_K.get() + offset_K.at(i), layout_K, extent_K);
       cutlass::TensorView<ElementP, LayoutP> view_P(block_P.get() + offset_P.at(i), layout_P, extent_P);
       cutlass::TensorView<ElementV, LayoutV> view_V(block_V.get() + offset_V.at(i), layout_V, extent_V);
+      cutlass::TensorView<ElementM, LayoutM> view_M(block_M.get() + offset_M.at(i), layout_M, extent_M);
 
       cutlass::DeviceAllocation<ElementP>    block_Ref(layout_P.capacity(extent_P));
       cutlass::TensorView<ElementP, LayoutP> view_Ref_device(block_Ref.get(), layout_P, extent_P);
@@ -913,12 +949,14 @@ public:
       ptr_K.get(),
       ptr_P.get(),
       ptr_V.get(),
+      ptr_M.get(),
       ptr_O.get(),
       ptr_O_accumulate.get(),
       ldq.get(),
       ldk.get(),
       ldp.get(),
       ldv.get(),
+      ldm.get(),
       ldo.get(),
       options.causal,
       options.alpha0,
