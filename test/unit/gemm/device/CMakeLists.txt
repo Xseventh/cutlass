@@ -536,6 +536,12 @@ cutlass_test_unit_add_executable(
   gemm_with_broadcast_f16n_f16n_f16n_tensorop_f32_sm75.cu
 
   gemm_with_reduction_f16t_f16n_f16n_tensorop_f32_sm80.cu
+  gemm_with_broadcast_f16n_f16n_f16n_tensorop_f32_sm80.cu
+)
+cutlass_test_unit_add_executable(
+  cutlass_test_unit_gemm_device_gemm_with_fused_dequant_epilogue_tensorop
+
+  gemm_with_broadcast_i8n_i8t_i8n_tensorop_i32_dequant_epilogue_sm80.cu
 )
 
 endif()
